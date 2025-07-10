@@ -1,0 +1,192 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <SoftwareSerial.h>
+#include <DHT.h>
+
+const char* ssid = "XXXXXX";
+const char* password = "YYYYYYYYY";
+
+// Vindriktning PMS5003 on D7 (GPIO13)
+SoftwareSerial pmsSerial(13, -1); // RX on GPIO13 (D7)
+
+// DHT11 on D3 (GPIO0)
+#define DHTPIN 0
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+ESP8266WebServer server(80);
+
+struct {
+  int pm25;
+  String aqiDescription;
+  String aqiColor;
+} state;
+
+float humidity = 0;
+float temperature = 0;
+
+const int historySize = 100;
+int pm25History[historySize];
+int historyIndex = 0;
+
+uint8_t buffer[20];
+int bufPos = 0;
+
+unsigned long lastDHTRead = 0;
+
+String getAQIDescription(int pm25) {
+  if (pm25 <= 12) return "Good";
+  else if (pm25 <= 35) return "Moderate";
+  else if (pm25 <= 55) return "Unhealthy for Sensitive Groups";
+  else if (pm25 <= 150) return "Unhealthy";
+  else if (pm25 <= 250) return "Very Unhealthy";
+  else return "Hazardous";
+}
+
+String getAQIColor(int pm25) {
+  if (pm25 <= 12) return "#00e400";  // Green
+  else if (pm25 <= 35) return "#ffff00"; // Yellow
+  else if (pm25 <= 55) return "#ff7e00"; // Orange
+  else if (pm25 <= 150) return "#ff0000"; // Red
+  else if (pm25 <= 250) return "#8f3f97"; // Purple
+  else return "#7e0023"; // Maroon
+}
+
+void setup() {
+  Serial.begin(9600);
+  pmsSerial.begin(9600);
+  dht.begin();
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected! IP:");
+  Serial.println(WiFi.localIP());
+
+  server.on("/", handleRoot);
+  server.on("/api/data", handleAPI);
+  server.begin();
+  Serial.println("Web server started");
+
+  for (int i = 0; i < historySize; i++) pm25History[i] = 0;
+}
+
+void loop() {
+  server.handleClient();
+
+  while (pmsSerial.available()) {
+    byte b = pmsSerial.read();
+    buffer[bufPos++] = b;
+    if (bufPos >= 20) {
+      state.pm25 = buffer[10];
+      state.aqiDescription = getAQIDescription(state.pm25);
+      state.aqiColor = getAQIColor(state.pm25);
+
+      pm25History[historyIndex++] = state.pm25;
+      if (historyIndex >= historySize) historyIndex = 0;
+
+      Serial.print("PM2.5: ");
+      Serial.print(state.pm25);
+      Serial.print(" => ");
+      Serial.println(state.aqiDescription);
+
+      bufPos = 0;
+    }
+  }
+
+  // Read DHT every 3s
+  if (millis() - lastDHTRead > 3000) {
+    lastDHTRead = millis();
+    humidity = dht.readHumidity();
+    temperature = dht.readTemperature();
+
+    if (isnan(humidity) || isnan(temperature)) {
+      Serial.println("❌ Failed to read from DHT11 sensor.");
+      humidity = temperature = -1; // signal error
+    } else {
+      Serial.print("🌡️ "); Serial.print(temperature);
+      Serial.print(" °C 💧 "); Serial.println(humidity);
+    }
+  }
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<title>Air Quality Monitor</title>";
+  html += "<script src='https://cdn.tailwindcss.com'></script>";
+  html += "<style>";
+  html += ".gradient-bg{background:linear-gradient(135deg,#e0e7ff,#f3e8ff);}";
+  html += ".card-shadow{box-shadow:0 4px 20px rgba(0,0,0,0.1);}";
+  html += ".graph-line{transition:all 0.3s ease;}";
+  html += ".legend-item{transition:transform 0.2s ease;}";
+  html += ".legend-item:hover{transform:scale(1.05);}";
+  html += "</style></head><body class='min-h-screen gradient-bg flex flex-col items-center justify-center p-4 sm:p-6'>";
+  html += "<div class='max-w-md w-full bg-white rounded-2xl card-shadow p-6 sm:p-8'>";
+  html += "<h1 class='text-2xl sm:text-3xl font-bold text-center text-gray-800 mb-4'>🌬️ Air Quality Monitor</h1>";
+  html += "<div class='bg-white rounded-xl p-6 text-center card-shadow mb-6' style='border:4px solid "+state.aqiColor+";'>";
+  html += "<h2 class='text-4xl sm:text-5xl font-extrabold text-gray-800'>"+String(state.pm25)+" <span class='text-lg sm:text-xl font-medium'>µg/m³</span></h2>";
+  html += "<h3 class='text-lg sm:text-xl font-semibold mt-2 text-gray-700'>"+state.aqiDescription+"</h3>";
+
+  html += "<div class='text-center text-gray-700 mt-4'>";
+  if (temperature == -1 || humidity == -1) {
+    html += "<p>🌡️ -- °C &nbsp; 💧 -- %</p>";
+  } else {
+    html += "<p>🌡️ "+String(temperature,1)+" °C &nbsp; 💧 "+String(humidity,1)+"%</p>";
+  }
+  html += "</div></div>";
+
+  html += "<div class='bg-white rounded-xl p-4 card-shadow'>";
+  html += "<svg width='100%' height='150' viewBox='0 0 340 150' preserveAspectRatio='xMidYMid meet'>";
+  html += "<line x1='40' y1='10' x2='40' y2='130' stroke='#d1d5db' stroke-width='1'/>";
+  html += "<text x='15' y='15' font-size='10' fill='#6b7280'>100</text>";
+  html += "<line x1='40' y1='40' x2='340' y2='40' stroke='#f3f4f6' stroke-width='1'/>";
+  html += "<text x='15' y='45' font-size='10' fill='#6b7280'>75</text>";
+  html += "<line x1='40' y1='70' x2='340' y2='70' stroke='#f3f4f6' stroke-width='1'/>";
+  html += "<text x='15' y='75' font-size='10' fill='#6b7280'>50</text>";
+  html += "<line x1='40' y1='100' x2='340' y2='100' stroke='#f3f4f6' stroke-width='1'/>";
+  html += "<text x='15' y='105' font-size='10' fill='#6b7280'>25</text>";
+  html += "<text x='15' y='135' font-size='10' fill='#6b7280'>0</text>";
+  html += "<line x1='40' y1='130' x2='340' y2='130' stroke='#d1d5db' stroke-width='1'/>";
+
+  for (int i = 0; i < historySize - 1; i++) {
+    int x1 = 40 + (i * 300) / (historySize - 1);
+    int y1 = 130 - (pm25History[(historyIndex + i) % historySize] * 120) / 100;
+    int x2 = 40 + ((i + 1) * 300) / (historySize - 1);
+    int y2 = 130 - (pm25History[(historyIndex + i + 1) % historySize] * 120) / 100;
+    html += "<line x1='"+String(x1)+"' y1='"+String(y1)+"' x2='"+String(x2)+"' y2='"+String(y2)+"' stroke='"+state.aqiColor+"' stroke-width='2' class='graph-line'/>";
+    if (i % 20 == 0) {
+      html += "<circle cx='"+String(x1)+"' cy='"+String(y1)+"' r='3' fill='"+state.aqiColor+"'>";
+      html += "<title>"+String(pm25History[(historyIndex + i) % historySize])+" µg/m³</title></circle>";
+    }
+  }
+  html += "</svg></div>";
+
+  html += "<div class='grid grid-cols-2 sm:grid-cols-3 gap-2 mt-6'>";
+  html += "<div class='legend-item bg-[#00e400] text-white text-center py-2 rounded-lg text-xs font-medium'>Good<br>0-12</div>";
+  html += "<div class='legend-item bg-[#ffff00] text-gray-800 text-center py-2 rounded-lg text-xs font-medium'>Moderate<br>13-35</div>";
+  html += "<div class='legend-item bg-[#ff7e00] text-white text-center py-2 rounded-lg text-xs font-medium'>Unh. SG<br>36-55</div>";
+  html += "<div class='legend-item bg-[#ff0000] text-white text-center py-2 rounded-lg text-xs font-medium'>Unhealthy<br>56-150</div>";
+  html += "<div class='legend-item bg-[#8f3f97] text-white text-center py-2 rounded-lg text-xs font-medium'>Very Unh.<br>151-250</div>";
+  html += "<div class='legend-item bg-[#7e0023] text-white text-center py-2 rounded-lg text-xs font-medium'>Hazardous<br>251+</div>";
+  html += "</div>";
+  html += "<p class='text-center text-gray-500 text-xs mt-6'>Auto-refresh every 5s | WHO guideline ≤5 µg/m³</p>";
+  html += "</div>";
+  html += "<script>setTimeout(() => location.reload(), 5000);</script>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleAPI() {
+  String json = "{";
+  json += "\"pm25\":"+String(state.pm25)+",";
+  json += "\"aqiDescription\":\""+state.aqiDescription+"\",";
+  json += "\"aqiColor\":\""+state.aqiColor+"\",";
+  json += "\"temperature\":"+String(temperature,1)+",";
+  json += "\"humidity\":"+String(humidity,1);
+  json += "}";
+  server.send(200, "application/json", json);
+}
